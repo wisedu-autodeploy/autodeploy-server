@@ -7,10 +7,15 @@ import (
 	"os/exec"
 	"runtime"
 
+	"github.com/satori/go.uuid"
+
+	"gopkg.in/olahol/melody.v1"
+
 	"github.com/gin-contrib/cors"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/gin-gonic/gin/json"
 	"github.com/lisiur/autodeploy/gitlab"
 	"github.com/lisiur/autodeploy/marathon"
 )
@@ -19,6 +24,17 @@ var commands = map[string]string{
 	"windows": "start",
 	"darwin":  "open",
 	"linux":   "xdg-open",
+}
+
+var deploySessions = map[string]DeploySession{}
+
+// DeploySession .
+// Status 0 -> init, -1 -> failed, 1 -> running, 2 -> succeed
+type DeploySession struct {
+	Params DeployCfg `json:"params"`
+	Step   int       `json:"step"`
+	Log    []string  `json:"log"`
+	Status int       `json:"status"`
 }
 
 // UserInfo .
@@ -48,16 +64,52 @@ func Open(uri string) error {
 }
 
 func main() {
-	gin.SetMode(gin.ReleaseMode)
+	// gin.SetMode(gin.ReleaseMode)
+
 	router := gin.Default()
+	m := melody.New()
+
 	router.Use(cors.Default())
 	// router.StaticFS("static", http.Dir("web/static"))
 	router.StaticFS("static", assetFS())
+
 	router.GET("/", func(c *gin.Context) {
 		router.LoadHTMLFiles("web/app.html")
 		c.HTML(http.StatusOK, "app.html", gin.H{
 			"title": "Welcome",
 		})
+	})
+
+	router.GET("/deploy/:uuid", func(c *gin.Context) {
+		m.HandleRequest(c.Writer, c.Request)
+	})
+	m.HandleConnect(func(s *melody.Session) {
+		//s.Write([]byte("test"))
+	})
+	m.HandleMessage(func(s *melody.Session, msg []byte) {
+		UUID := string(msg)
+		deploySession, ok := deploySessions[UUID]
+		if !ok {
+			res := map[string]interface{}{
+				"code":    "-1",
+				"message": "not found UUID",
+				"data":    nil,
+			}
+			jsonRes, _ := json.Marshal((res))
+			s.Write(jsonRes)
+		} else {
+			if deploySession.Status == 0 { // 未开始
+				go deploy(&deploySession, s)
+			} else {
+				res := map[string]interface{}{
+					"code":    "0",
+					"message": "build done",
+					"data":    deploySession,
+				}
+				jsonRes, _ := json.Marshal((res))
+				s.Write(jsonRes)
+			}
+		}
 	})
 
 	v1 := router.Group("/v1/api")
@@ -103,7 +155,27 @@ func main() {
 			return
 		})
 
-		v1.POST("/autodeploy", deploy)
+		v1.POST("/autodeploy", func(c *gin.Context) {
+			var config DeployCfg
+			var UUID = uuid.Must(uuid.NewV4()).String()
+
+			c.BindJSON(&config)
+
+			deploySessions[UUID] = DeploySession{
+				Params: config,
+				Step:   -1,
+				Log:    []string{},
+			}
+
+			c.JSON(200, gin.H{
+				"code":    "0",
+				"message": "success",
+				"data": map[string]interface{}{
+					"uuid": UUID,
+				},
+			})
+			return
+		})
 	}
 
 	err := Open("http://localhost:2334/static/app.html")
@@ -113,10 +185,11 @@ func main() {
 	router.Run(":2334")
 }
 
-func deploy(c *gin.Context) {
+func deploy(ds *DeploySession, s *melody.Session) {
 	var err error
-	var config DeployCfg
-	c.BindJSON(&config)
+	var config = ds.Params
+	var res interface{}
+	var jsonRes []byte
 
 	var gitlabCfg = gitlab.Config{
 		Origin:      "http://172.16.7.53:9090",
@@ -129,56 +202,68 @@ func deploy(c *gin.Context) {
 		Name:         config.Name,
 		MarathonName: config.MarathonName,
 	}
+
+	ds.Step = 0
+	ds.Status = 1 // running
+	res = map[string]interface{}{
+		"code":    "0",
+		"message": "",
+		"data":    ds,
+	}
+	jsonRes, _ = json.Marshal(res)
+	s.Write(jsonRes)
+
 	_, err = gitlab.Init(gitlabCfg)
 	if err != nil {
-		c.JSON(200, gin.H{
-			"code":    "-1",
-			"message": err.Error(),
-			"data":    nil,
-		})
 		return
 	}
 
 	log.Println("new tag")
 	tag, err := gitlab.NewTag(marathonCfg)
 	if err != nil {
-		c.JSON(200, gin.H{
-			"code":    "-1",
-			"message": err.Error(),
-			"data":    nil,
-		})
 		return
 	}
+
+	ds.Step = 1
+	res = map[string]interface{}{
+		"code":    "0",
+		"message": "",
+		"data":    ds,
+	}
+	jsonRes, _ = json.Marshal(res)
+	s.Write(jsonRes)
 
 	log.Println("building")
 	ok, _, image, err := gitlab.WatchBuildLog(marathonCfg, tag, false)
 	if err != nil || !ok {
-		c.JSON(200, gin.H{
-			"code":    "-1",
-			"message": err.Error(),
-			"data":    nil,
-		})
 		return
 	}
+
+	ds.Step = 2
+	res = map[string]interface{}{
+		"code":    "0",
+		"message": "",
+		"data":    ds,
+	}
+	jsonRes, _ = json.Marshal(res)
+	s.Write(jsonRes)
 
 	log.Println("deploying")
 	ok, err = marathon.Deploy(marathonCfg.MarathonName, image)
 	if err != nil || !ok {
-		c.JSON(200, gin.H{
-			"code":    "-1",
-			"message": err.Error(),
-			"data":    nil,
-		})
 		return
 	}
 
-	if ok {
-		log.Println("done")
-		c.JSON(200, gin.H{
-			"code":    "-1",
-			"message": err.Error(),
-			"data":    nil,
-		})
-		return
+	ds.Step = 3
+	ds.Status = 2 // succeed
+	res = map[string]interface{}{
+		"code":    "0",
+		"message": "",
+		"data":    ds,
 	}
+	jsonRes, _ = json.Marshal(res)
+	s.Write(jsonRes)
+
+	log.Println("done")
+	return
 }
