@@ -51,11 +51,12 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 	router.Use(cors.Default())
-	router.StaticFS("static", http.Dir("dist/static"))
+	// router.StaticFS("static", http.Dir("web/static"))
+	router.StaticFS("static", assetFS())
 	router.GET("/", func(c *gin.Context) {
-		router.LoadHTMLFiles("dist/index.html")
-		c.HTML(http.StatusOK, "index.html", gin.H{
-			"title": "Main website",
+		router.LoadHTMLFiles("web/app.html")
+		c.HTML(http.StatusOK, "app.html", gin.H{
+			"title": "Welcome",
 		})
 	})
 
@@ -105,7 +106,7 @@ func main() {
 		v1.POST("/autodeploy", deploy)
 	}
 
-	err := Open("http://localhost:2334")
+	err := Open("http://localhost:2334/static/app.html")
 	if err != nil {
 		log.Println(err)
 	}
