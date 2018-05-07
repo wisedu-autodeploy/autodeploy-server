@@ -1,7 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"net/http"
+	"os/exec"
+	"runtime"
 
 	"github.com/gin-contrib/cors"
 
@@ -10,6 +14,12 @@ import (
 	"github.com/lisiur/autodeploy/gitlab"
 	"github.com/lisiur/autodeploy/marathon"
 )
+
+var commands = map[string]string{
+	"windows": "start",
+	"darwin":  "open",
+	"linux":   "xdg-open",
+}
 
 // UserInfo .
 type UserInfo struct {
@@ -26,9 +36,29 @@ type DeployCfg struct {
 	MarathonName string `json:"marathon_name,omitempty"`
 }
 
+// Open calls the OS default program for uri
+func Open(uri string) error {
+	run, ok := commands[runtime.GOOS]
+	if !ok {
+		return fmt.Errorf("don't know how to open things on %s platform", runtime.GOOS)
+	}
+
+	cmd := exec.Command(run, uri)
+	return cmd.Start()
+}
+
 func main() {
+	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 	router.Use(cors.Default())
+	router.StaticFS("static", http.Dir("dist/static"))
+	router.GET("/", func(c *gin.Context) {
+		router.LoadHTMLFiles("dist/index.html")
+		c.HTML(http.StatusOK, "index.html", gin.H{
+			"title": "Main website",
+		})
+	})
+
 	v1 := router.Group("/v1/api")
 	{
 		v1.POST("/login", func(c *gin.Context) {
@@ -75,7 +105,11 @@ func main() {
 		v1.POST("/autodeploy", deploy)
 	}
 
-	router.Run(":8080")
+	err := Open("http://localhost:2334")
+	if err != nil {
+		log.Println(err)
+	}
+	router.Run(":2334")
 }
 
 func deploy(c *gin.Context) {
@@ -116,7 +150,7 @@ func deploy(c *gin.Context) {
 	}
 
 	log.Println("building")
-	ok, _, image, err := gitlab.WatchBuildLog(marathonCfg, tag, true)
+	ok, _, image, err := gitlab.WatchBuildLog(marathonCfg, tag, false)
 	if err != nil || !ok {
 		c.JSON(200, gin.H{
 			"code":    "-1",
