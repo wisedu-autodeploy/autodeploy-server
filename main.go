@@ -26,15 +26,18 @@ var commands = map[string]string{
 	"linux":   "xdg-open",
 }
 
-var deploySessions = map[string]DeploySession{}
+var deploySessions = map[string]*DeploySession{}
+var websocketSessions = map[string]*melody.Session{}
 
 // DeploySession .
 // Status 0 -> init, -1 -> failed, 1 -> running, 2 -> succeed
 type DeploySession struct {
-	Params DeployCfg `json:"params"`
-	Step   int       `json:"step"`
-	Log    []string  `json:"log"`
-	Status int       `json:"status"`
+	Params DeployCfg `json:"params,omitempty"`
+	Step   int       `json:"step,omitempty"`
+	Log    []string  `json:"log,omitempty"`
+	Status int       `json:"status,omitempty"`
+	Tag    string    `json:"tag,omitempty"`
+	Image  string    `json:"image,omitempty"`
 }
 
 // UserInfo .
@@ -50,6 +53,7 @@ type DeployCfg struct {
 	Maintainer   string `json:"maintainer,omitempty"`
 	Name         string `json:"name,omitempty"`
 	MarathonName string `json:"marathon_name,omitempty"`
+	MarathonID   string `json:"marathon_id,omitempty"`
 }
 
 // Open calls the OS default program for uri
@@ -64,7 +68,7 @@ func Open(uri string) error {
 }
 
 func main() {
-	// gin.SetMode(gin.ReleaseMode)
+	gin.SetMode(gin.ReleaseMode)
 
 	router := gin.Default()
 	m := melody.New()
@@ -89,6 +93,7 @@ func main() {
 	m.HandleMessage(func(s *melody.Session, msg []byte) {
 		UUID := string(msg)
 		deploySession, ok := deploySessions[UUID]
+		websocketSessions[UUID] = s
 		if !ok {
 			res := map[string]interface{}{
 				"code":    "-1",
@@ -99,11 +104,11 @@ func main() {
 			s.Write(jsonRes)
 		} else {
 			if deploySession.Status == 0 { // 未开始
-				go deploy(&deploySession, s)
+				go deploy(deploySession, UUID)
 			} else {
 				res := map[string]interface{}{
 					"code":    "0",
-					"message": "build done",
+					"message": "",
 					"data":    deploySession,
 				}
 				jsonRes, _ := json.Marshal((res))
@@ -161,7 +166,7 @@ func main() {
 
 			c.BindJSON(&config)
 
-			deploySessions[UUID] = DeploySession{
+			deploySessions[UUID] = &DeploySession{
 				Params: config,
 				Step:   -1,
 				Log:    []string{},
@@ -182,14 +187,20 @@ func main() {
 	if err != nil {
 		log.Println(err)
 	}
+
 	router.Run(":2334")
 }
 
-func deploy(ds *DeploySession, s *melody.Session) {
+func deploy(ds *DeploySession, UUID string) {
 	var err error
 	var config = ds.Params
 	var res interface{}
 	var jsonRes []byte
+
+	var s, ok = websocketSessions[UUID]
+	if !ok {
+		return
+	}
 
 	var gitlabCfg = gitlab.Config{
 		Origin:      "http://172.16.7.53:9090",
@@ -201,8 +212,10 @@ func deploy(ds *DeploySession, s *melody.Session) {
 		Maintainer:   config.Maintainer,
 		Name:         config.Name,
 		MarathonName: config.MarathonName,
+		MarathonID:   config.MarathonID,
 	}
 
+	// tag
 	ds.Step = 0
 	ds.Status = 1 // running
 	res = map[string]interface{}{
@@ -211,6 +224,11 @@ func deploy(ds *DeploySession, s *melody.Session) {
 		"data":    ds,
 	}
 	jsonRes, _ = json.Marshal(res)
+
+	s, ok = websocketSessions[UUID]
+	if !ok {
+		return
+	}
 	s.Write(jsonRes)
 
 	_, err = gitlab.Init(gitlabCfg)
@@ -224,13 +242,20 @@ func deploy(ds *DeploySession, s *melody.Session) {
 		return
 	}
 
+	// building
 	ds.Step = 1
+	ds.Tag = tag
 	res = map[string]interface{}{
 		"code":    "0",
 		"message": "",
 		"data":    ds,
 	}
 	jsonRes, _ = json.Marshal(res)
+
+	s, ok = websocketSessions[UUID]
+	if !ok {
+		return
+	}
 	s.Write(jsonRes)
 
 	log.Println("building")
@@ -239,18 +264,39 @@ func deploy(ds *DeploySession, s *melody.Session) {
 		return
 	}
 
+	// deploy
 	ds.Step = 2
+	ds.Image = image
 	res = map[string]interface{}{
 		"code":    "0",
 		"message": "",
 		"data":    ds,
 	}
 	jsonRes, _ = json.Marshal(res)
+
+	s, ok = websocketSessions[UUID]
+	if !ok {
+		return
+	}
 	s.Write(jsonRes)
 
 	log.Println("deploying")
-	ok, err = marathon.Deploy(marathonCfg.MarathonName, image)
+	ok, err = marathon.Deploy(marathonCfg, image)
 	if err != nil || !ok {
+		log.Println(err)
+		res = map[string]interface{}{
+			"code":    "-1",
+			"message": err.Error(),
+			"data":    ds,
+		}
+		jsonRes, _ = json.Marshal(res)
+
+		s, ok = websocketSessions[UUID]
+		if !ok {
+			return
+		}
+		s.Write(jsonRes)
+
 		return
 	}
 
@@ -262,6 +308,11 @@ func deploy(ds *DeploySession, s *melody.Session) {
 		"data":    ds,
 	}
 	jsonRes, _ = json.Marshal(res)
+
+	s, ok = websocketSessions[UUID]
+	if !ok {
+		return
+	}
 	s.Write(jsonRes)
 
 	log.Println("done")
