@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os/exec"
 	"runtime"
+	"sync"
 
 	"github.com/satori/go.uuid"
 
@@ -16,8 +17,8 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/gin-gonic/gin/json"
-	"github.com/lisiur/autodeploy/gitlab"
-	"github.com/lisiur/autodeploy/marathon"
+	"github.com/wisedu-autodeploy/autodeploy/gitlab"
+	"github.com/wisedu-autodeploy/autodeploy/marathon"
 )
 
 var commands = map[string]string{
@@ -56,6 +57,13 @@ type DeployCfg struct {
 	MarathonID   string `json:"marathon_id,omitempty"`
 }
 
+// BaseResponse .
+type BaseResponse struct {
+	Code    string      `json:"code,omitempty"`
+	Data    interface{} `json:"data,omitempty"`
+	Message string      `json:"message,omitempty"`
+}
+
 // Open calls the OS default program for uri
 func Open(uri string) error {
 	run, ok := commands[runtime.GOOS]
@@ -63,8 +71,10 @@ func Open(uri string) error {
 		return fmt.Errorf("don't know how to open things on %s platform", runtime.GOOS)
 	}
 
-	cmd := exec.Command(run, uri)
-	return cmd.Start()
+	if runtime.GOOS == "windows" {
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", uri).Start()
+	}
+	return exec.Command(run, uri).Start()
 }
 
 func main() {
@@ -74,7 +84,6 @@ func main() {
 	m := melody.New()
 
 	router.Use(cors.Default())
-	// router.StaticFS("static", http.Dir("web/static"))
 	router.StaticFS("static", assetFS())
 
 	router.GET("/", func(c *gin.Context) {
@@ -94,24 +103,14 @@ func main() {
 		UUID := string(msg)
 		deploySession, ok := deploySessions[UUID]
 		websocketSessions[UUID] = s
-		if !ok {
-			res := map[string]interface{}{
-				"code":    "-1",
-				"message": "not found UUID",
-				"data":    nil,
-			}
-			jsonRes, _ := json.Marshal((res))
+		if !ok { // not found related deploy session
+			jsonRes := jsonResponse("-1", nil, "not found UUID")
 			s.Write(jsonRes)
-		} else {
+		} else { // found related deploy session
 			if deploySession.Status == 0 { // 未开始
 				go deploy(deploySession, UUID)
 			} else {
-				res := map[string]interface{}{
-					"code":    "0",
-					"message": "",
-					"data":    deploySession,
-				}
-				jsonRes, _ := json.Marshal((res))
+				jsonRes := jsonResponse("0", deploySession, "")
 				s.Write(jsonRes)
 			}
 		}
@@ -122,32 +121,21 @@ func main() {
 		v1.POST("/login", func(c *gin.Context) {
 			var userInfo UserInfo
 			c.BindJSON(&userInfo)
-			gitlabCfg := gitlab.Config{
-				Origin:      "http://172.16.7.53:9090",
-				LoginAction: "/users/sign_in",
-				Username:    userInfo.Username,
-				Password:    userInfo.Password,
+			gitlabUser := gitlab.User{
+				Username: userInfo.Username,
+				Password: userInfo.Password,
 			}
-			_, err := gitlab.Init(gitlabCfg)
+			gitlabApps, err := gitlab.GetAllApps(gitlabUser)
 			if err != nil {
-				c.JSON(200, gin.H{
-					"code":    "-1",
-					"message": err.Error(),
-					"data":    nil,
-				})
-				return
-			}
-			gitlabApps, err := gitlab.GetAllApps()
-			if err != nil {
-				c.JSON(200, gin.H{
-					"code":    "-1",
-					"message": err.Error(),
-					"data":    nil,
-				})
+				handleErr(c, err)
 				return
 			}
 
-			marathonApps := marathon.GetApps()
+			marathonApps, err := marathon.GetApps()
+			if err != nil {
+				handleErr(c, err)
+				return
+			}
 
 			c.JSON(200, gin.H{
 				"code":    "0",
@@ -192,6 +180,7 @@ func main() {
 }
 
 func deploy(ds *DeploySession, UUID string) {
+	// gitlab.Debugger()
 	var err error
 	var config = ds.Params
 	var res interface{}
@@ -202,15 +191,17 @@ func deploy(ds *DeploySession, UUID string) {
 		return
 	}
 
-	var gitlabCfg = gitlab.Config{
-		Origin:      "http://172.16.7.53:9090",
-		LoginAction: "/users/sign_in",
-		Username:    config.Username,
-		Password:    config.Password,
+	var gitlabParams = gitlab.Params{
+		User: gitlab.User{
+			Username: config.Username,
+			Password: config.Password,
+		},
+		Project: gitlab.Project{
+			Maintainer: config.Maintainer,
+			Name:       config.Name,
+		},
 	}
 	var marathonCfg = marathon.Config{
-		Maintainer:   config.Maintainer,
-		Name:         config.Name,
 		MarathonName: config.MarathonName,
 		MarathonID:   config.MarathonID,
 	}
@@ -218,26 +209,14 @@ func deploy(ds *DeploySession, UUID string) {
 	// tag
 	ds.Step = 0
 	ds.Status = 1 // running
-	res = map[string]interface{}{
-		"code":    "0",
-		"message": "",
-		"data":    ds,
+	res = BaseResponse{
+		Code:    "0",
+		Data:    ds,
+		Message: "",
 	}
-	jsonRes, _ = json.Marshal(res)
+	putMsg(res, UUID)
 
-	s, ok = websocketSessions[UUID]
-	if !ok {
-		return
-	}
-	s.Write(jsonRes)
-
-	_, err = gitlab.Init(gitlabCfg)
-	if err != nil {
-		return
-	}
-
-	log.Println("new tag")
-	tag, err := gitlab.NewTag(marathonCfg)
+	tag, err := gitlab.NewTag(gitlabParams)
 	if err != nil {
 		return
 	}
@@ -245,51 +224,47 @@ func deploy(ds *DeploySession, UUID string) {
 	// building
 	ds.Step = 1
 	ds.Tag = tag
-	res = map[string]interface{}{
-		"code":    "0",
-		"message": "",
-		"data":    ds,
+	res = BaseResponse{
+		Code:    "0",
+		Data:    ds,
+		Message: "",
 	}
-	jsonRes, _ = json.Marshal(res)
+	putMsg(res, UUID)
 
-	s, ok = websocketSessions[UUID]
-	if !ok {
-		return
-	}
-	s.Write(jsonRes)
+	var wg sync.WaitGroup
+	logChan := make(chan *gitlab.Logger)
+	wg.Add(2)
 
-	log.Println("building")
-	ok, _, image, err := gitlab.WatchBuildLog(marathonCfg, tag, false)
-	if err != nil || !ok {
-		return
-	}
+	go gitlab.WatchBuildLog(gitlabParams, tag, logChan, &wg) // 写日志
+	go gitlab.GetBuildLog(func(logger *gitlab.Logger) {
+		ds.Log = logger.Log
+		res = BaseResponse{
+			Code:    "0",
+			Data:    ds,
+			Message: "",
+		}
+		putMsg(res, UUID)
+	}, logChan, &wg)
+
+	wg.Wait()
 
 	// deploy
+	logger := <-logChan
+	close(logChan)
+	image := logger.Image
 	ds.Step = 2
 	ds.Image = image
-	res = map[string]interface{}{
-		"code":    "0",
-		"message": "",
-		"data":    ds,
+	res = BaseResponse{
+		Code:    "0",
+		Data:    ds,
+		Message: "",
 	}
-	jsonRes, _ = json.Marshal(res)
+	putMsg(res, UUID)
 
-	s, ok = websocketSessions[UUID]
-	if !ok {
-		return
-	}
-	s.Write(jsonRes)
-
-	log.Println("deploying")
 	ok, err = marathon.Deploy(marathonCfg, image)
 	if err != nil || !ok {
 		log.Println(err)
-		res = map[string]interface{}{
-			"code":    "-1",
-			"message": err.Error(),
-			"data":    ds,
-		}
-		jsonRes, _ = json.Marshal(res)
+		jsonRes = jsonResponse("-1", ds, err.Error())
 
 		s, ok = websocketSessions[UUID]
 		if !ok {
@@ -302,12 +277,7 @@ func deploy(ds *DeploySession, UUID string) {
 
 	ds.Step = 3
 	ds.Status = 2 // succeed
-	res = map[string]interface{}{
-		"code":    "0",
-		"message": "",
-		"data":    ds,
-	}
-	jsonRes, _ = json.Marshal(res)
+	jsonRes = jsonResponse("0", ds, "")
 
 	s, ok = websocketSessions[UUID]
 	if !ok {
@@ -315,6 +285,35 @@ func deploy(ds *DeploySession, UUID string) {
 	}
 	s.Write(jsonRes)
 
-	log.Println("done")
+	// TODO: delete websocketSessions[UUID]
 	return
+}
+
+func jsonResponse(code string, data interface{}, message string) (jsonRes []byte) {
+	res := BaseResponse{
+		Code:    code,
+		Data:    data,
+		Message: message,
+	}
+	jsonRes, _ = json.Marshal(res)
+	return
+}
+
+func handleErr(c *gin.Context, err error) {
+	log.Println(err)
+	c.JSON(200, gin.H{
+		"code":    "-1",
+		"message": err.Error(),
+		"data":    nil,
+	})
+}
+
+func putMsg(res interface{}, UUID string) {
+	jsonRes, _ := json.Marshal(res)
+
+	s, ok := websocketSessions[UUID]
+	if !ok {
+		return
+	}
+	s.Write(jsonRes)
 }
